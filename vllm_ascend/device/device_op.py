@@ -631,8 +631,9 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             routed_scaling_factor=routed_scaling_factor,
             eps=eps,
         )
-        if norm_type == 0 and renorm == 1:
+        if renorm == 1: #TODO: condition right?
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights * 3.0 #TODO: hardcoding, tbc.
 
         return topk_weights, topk_ids.to(torch.int32), out
 

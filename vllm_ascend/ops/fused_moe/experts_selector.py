@@ -298,7 +298,7 @@ def _select_experts_with_fusion_ops(
         k=top_k,
         k_group=topk_group,
         group_count=num_expert_group,
-        group_select_mode=1,
+        group_select_mode=0, #TODO: How to control this param
         renorm=renorm,
         norm_type=norm_type,  # 0: softmax; 1: sigmoid
         out_flag=False,

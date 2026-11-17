@@ -132,3 +132,8 @@ loading the operator environment, run from the repository root on Ascend A5 (950
 ```bash
 pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_region_score.py
 ```
+
+## A3 BF16
+
+See [A3 implementation and validation](A3.md) for supported dtypes, workspace,
+validation evidence and numerical limitations.

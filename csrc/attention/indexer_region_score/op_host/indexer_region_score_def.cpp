@@ -40,6 +40,17 @@ public:
             .ExtendCfgInfo("opInterface.value", "indexer_region_score")
             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
         this->AICore().AddConfig("ascend950", config);
+        // A3 accepts native BF16 Q/K only. Keep the original A5 dtype table.
+        OpAICoreConfig a3Config;
+        a3Config.DynamicCompileStaticFlag(true).DynamicFormatFlag(false).DynamicRankSupportFlag(false)
+            .DynamicShapeSupportFlag(true).NeedCheckSupportFlag(false).PrecisionReduceFlag(false)
+            .ExtendCfgInfo("opFile.value", "indexer_region_score")
+            .ExtendCfgInfo("opInterface.value", "indexer_region_score")
+            .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
+        a3Config.Input("query").DataType({ge::DT_BF16, ge::DT_BF16, ge::DT_BF16});
+        a3Config.Input("weights").DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT});
+        a3Config.Input("key_summary").DataType({ge::DT_BF16, ge::DT_BF16, ge::DT_BF16});
+        this->AICore().AddConfig("ascend910_93", a3Config);
     }
 };
 OP_ADD(IndexerRegionScore);

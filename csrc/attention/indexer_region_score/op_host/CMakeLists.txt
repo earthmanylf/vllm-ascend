@@ -6,7 +6,13 @@ if(BUILD_OPEN_PROJECT)
 endif()
 add_ops_compile_options(
     OP_NAME IndexerRegionScore
+    COMPUTE_UNIT ascend950
     OPTIONS --cce-auto-sync=off -Wno-deprecated-declarations -Werror
             -mllvm -cce-vf-remove-membar=false
+)
+add_ops_compile_options(
+    OP_NAME IndexerRegionScore
+    COMPUTE_UNIT ascend910_93
+    OPTIONS --cce-auto-sync=off -Wno-deprecated-declarations
 )
 add_modules_sources(OPTYPE indexer_region_score ACLNNTYPE aclnn_exclude)

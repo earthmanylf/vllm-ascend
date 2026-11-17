@@ -31,7 +31,6 @@ schema's write-alias contract.
 import pytest
 import torch
 import torch_npu  # noqa: F401
-
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.utils import enable_custom_op
@@ -43,7 +42,7 @@ SENTINEL = -313
 GUARD_ELEMENTS = 8
 
 
-def make_inputs(query_lengths, regions, page_size, lengths, *, groups, heads, dtype, ties=False):
+def make_inputs(query_lengths, regions, page_size, lengths, *, groups, heads, dtype, ties=False, linear_pages=False):
     """Binary-fraction inputs (exact through every dtype here) and a poisoned
     2-layer cache backing whose layer-1 strided view is the operator input."""
     generator = torch.Generator().manual_seed(431)
@@ -61,7 +60,11 @@ def make_inputs(query_lengths, regions, page_size, lengths, *, groups, heads, dt
     backing = torch.full((pages, 2, page_size, 1, HEAD_DIM), 31.0).to(dtype)
     backing[:, 1] = keys
     # Permuted pages expose affine-only cache addressing.
-    table = torch.randperm(pages, generator=generator)[: len(query_lengths) * columns]
+    if linear_pages:
+        # Different contiguous page bases expose request-local cache reuse.
+        table = torch.arange(len(query_lengths) * columns)
+    else:
+        table = torch.randperm(pages, generator=generator)[: len(query_lengths) * columns]
     table = table.reshape(len(query_lengths), columns).to(torch.int32)
     cu = torch.tensor([0, *torch.tensor(query_lengths).cumsum(0).tolist()], dtype=torch.int32)
     return query, weights, backing, torch.tensor(lengths, dtype=torch.int32), table, cu
@@ -96,12 +99,36 @@ def reference_ids(query, weights, backing, lengths, table, cu, *, regions, top_k
     return ids
 
 
-def check_case(query_lengths, regions, page_size, top_k, lengths, *, groups, heads, dtype, ties=False, ids=None):
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+def check_case(
+    query_lengths,
+    regions,
+    page_size,
+    top_k,
+    lengths,
+    *,
+    groups,
+    heads,
+    dtype,
+    ties=False,
+    ids=None,
+    linear_pages=False,
+):
+    device_type = get_ascend_device_type()
+    if device_type == AscendDeviceType.A3 and dtype != torch.bfloat16:
+        pytest.skip("A3 IndexerRegionScore requires BF16 query and key")
+    if device_type not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     enable_custom_op()
     query, weights, backing, lengths, table, cu = make_inputs(
-        query_lengths, regions, page_size, lengths, groups=groups, heads=heads, dtype=dtype, ties=ties
+        query_lengths,
+        regions,
+        page_size,
+        lengths,
+        groups=groups,
+        heads=heads,
+        dtype=dtype,
+        ties=ties,
+        linear_pages=linear_pages,
     )
     expected = reference_ids(query, weights, backing, lengths, table, cu, regions=regions, top_k=top_k)
 
@@ -111,10 +138,13 @@ def check_case(query_lengths, regions, page_size, top_k, lengths, *, groups, hea
     # cache_mode=1, mask_mode=3, sort_mode=1.
     if ids is None:
         ids = torch.empty((groups, tokens, top_k), dtype=torch.int32, device="npu")
+    key_cache = backing.npu()[:, 1]
+    if linear_pages:
+        key_cache = key_cache.contiguous()
     torch.ops._C_ascend.npu_indexer_region_score.ids_out(
         query.npu(),
         weights.npu(),
-        backing.npu()[:, 1],
+        key_cache,
         lengths.npu(),
         table.npu(),
         cu.npu(),
@@ -191,8 +221,8 @@ def test_output_written_through_strided_view():
     """selected_region_ids may be a non-contiguous view: the operator must
     write through its strides and never touch neighbouring elements
     (SENTINEL guards before, after, and in the interleaved gaps)."""
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+    if get_ascend_device_type() not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     groups, tokens, top_k = 4, 3, 7
     storage = torch.full((groups * tokens * top_k * 2 + 2 * GUARD_ELEMENTS,), SENTINEL, dtype=torch.int32, device="npu")
     ids = storage[GUARD_ELEMENTS:-GUARD_ELEMENTS:2].view(groups, tokens, top_k)
@@ -207,8 +237,8 @@ def test_output_written_through_strided_view():
 def test_schema_declares_write_alias_output():
     """The ids_out overload returns nothing: selected_region_ids is the
     kwarg-only write-alias output argument of the schema."""
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+    if get_ascend_device_type() not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     enable_custom_op()
     schema = torch.ops._C_ascend.npu_indexer_region_score.ids_out._schema
     assert not schema.returns
@@ -216,3 +246,49 @@ def test_schema_declares_write_alias_output():
     assert output.name == "selected_region_ids"
     assert output.kwarg_only and not output.has_default_value()
     assert output.alias_info.is_write
+
+
+@pytest.mark.parametrize("groups,heads,regions,page_size", [(8, 20, 129, 17), (12, 124, 9, 3)])
+def test_bf16_non_aligned_head_counts(groups, heads, regions, page_size):
+    """Exercise BF16 Cube M padding and region tile tails on A3 and A5."""
+    check_case(
+        (2,),
+        regions,
+        page_size,
+        min(regions, 17),
+        (regions * REGION_SIZE + 2,),
+        groups=groups,
+        heads=heads,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(
+    "regions,top_k,ties",
+    [
+        (23, 11, False),
+        (25, 9, False),
+        (33, 17, False),
+        (513, 512, False),
+        (639, 512, False),
+        (639, 512, True),
+        (1024, 511, False),
+        (1025, 512, False),
+    ],
+)
+def test_bf16_query_bundles_and_threshold_boundaries(regions, top_k, ties):
+    """Cross request/bundle tails, short masks and the vector/fallback cutoff."""
+    query_lengths = (3, 0, 5, 9)
+    lengths = tuple(regions * REGION_SIZE + count if count else 0 for count in query_lengths)
+    check_case(
+        query_lengths,
+        regions,
+        1,
+        top_k,
+        lengths,
+        groups=4,
+        heads=4,
+        dtype=torch.bfloat16,
+        ties=ties,
+        linear_pages=True,
+    )

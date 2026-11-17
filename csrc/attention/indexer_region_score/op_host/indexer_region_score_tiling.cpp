@@ -10,6 +10,7 @@
 #include "indexer_region_score_shard_plan.h"
 #include "indexer_region_score_bounded_workspace.h"
 #include "../op_kernel/indexer_region_score_paged_tiling_data.h"
+#include "arch22/indexer_region_score_tiling_a3.h"
 namespace optiling {
 namespace {
 constexpr uint32_t MIN_HEADS = 4, MAX_HEADS = 128, DIM = 256, MAX_REGIONS = 16777216, MAX_TOP_K = 512;
@@ -18,6 +19,11 @@ using IndexerRegionScorePaged::PagedTilingData;
 
 ge::graphStatus Tiling(gert::TilingContext *context)
 {
+    OP_CHECK_NULL_WITH_CONTEXT(context, context->GetPlatformInfo());
+    platform_ascendc::PlatformAscendC target(context->GetPlatformInfo());
+    if (target.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910_93) {
+        return IndexerRegionScoreA3Tiling::Tiling(context);
+    }
     const auto *attrs = context->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     const auto *regions = attrs->GetAttrPointer<int64_t>(0);

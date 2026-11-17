@@ -1,0 +1,8 @@
+pr: 1
+entries:
+  - category: hardware
+    text: Added a standalone A3 BF16 IndexerRegionScore implementation with FP32 scoring and bounded IDs-only workspace. Hardware integration and numerical stress limitations are documented with the operator.
+    hardware: [A3]
+  - category: performance
+    text: Optimized A3 BF16 IndexerRegionScore query reuse and deterministic region selection without increasing its workspace budget. Compatibility benchmarks and precision limits are documented with the operator.
+    hardware: [A3]

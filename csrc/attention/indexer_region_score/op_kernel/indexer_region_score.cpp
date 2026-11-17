@@ -1,3 +1,41 @@
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201)) || (__CCE_AICORE__ == 220)
+// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+// Licensed under the CANN Open Software License Agreement Version 2.0.
+#include "arch22/indexer_region_score_a3.h"
+#include "lib/matmul_intf.h"
+using namespace IndexerRegionScorePaged;
+using IndexerRegionScoreA3::A3IndexerRegionScore;
+extern "C" __global__ __aicore__ void indexer_region_score(
+    GM_ADDR query, GM_ADDR weights, GM_ADDR key, GM_ADDR lengths,
+    GM_ADDR table, GM_ADDR cu, GM_ADDR output, GM_ADDR ids,
+    GM_ADDR workspace, GM_ADDR tiling)
+{
+    REGISTER_TILING_DEFAULT(PagedTilingData);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if (TILING_KEY_IS(31)) {
+        PagedTilingData data{};
+        auto *dst = reinterpret_cast<uint32_t *>(&data);
+        auto *src = reinterpret_cast<__gm__ uint32_t *>(tiling);
+        for (uint32_t i = 0; i < sizeof(data) / sizeof(uint32_t); ++i) dst[i] = src[i];
+        AscendC::TPipe pipe;
+        GM_ADDR user = AscendC::GetUserWorkspace(workspace);
+        if (data.batchTokens != 0U) output = user + data.scorePoolOffset;
+        do {
+            data.batchCount = data.batchTokens == 0U ? data.totalTokens :
+                (data.batchTokens < data.totalTokens - data.batchBegin ? data.batchTokens : data.totalTokens - data.batchBegin);
+            A3IndexerRegionScore kernel;
+            kernel.Init(query, weights, key, lengths, table, cu, output, ids, user, data, &pipe);
+            kernel.Process();
+            if (data.batchTokens == 0U) break;
+            data.batchBegin += data.batchCount;
+            if (data.batchBegin == data.totalTokens) break;
+            AscendC::SyncAll<false>();
+            pipe.Reset();
+        } while (data.batchBegin < data.totalTokens);
+    }
+}
+
+#else
 // Copyright (c) 2026 Huawei Technologies Co., Ltd.
 // Licensed under the CANN Open Software License Agreement Version 2.0.
 #include "indexer_region_score_common.h"
@@ -84,3 +122,5 @@ extern "C" __global__ __aicore__ void indexer_region_score(
         } while (data.batchBegin < data.totalTokens);
     }
 }
+
+#endif

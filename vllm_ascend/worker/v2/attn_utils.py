@@ -1170,14 +1170,13 @@ def _allocate_kv_cache(
                 step_backings[backing_key] = step_backing
             for layer_idx, layer_name in enumerate(shared_names):
                 layer_spec = layer_kv_cache_spec[layer_name]
-                layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
-                if (
-                    kv_cache_tensor.layer_stride != layer_size
-                    or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
-                ):
+                page_size = layer_spec.page_size_bytes
+                layer_size = kv_cache_config.num_blocks * page_size
+                page_stride = kv_cache_tensor.block_stride
+                if kv_cache_tensor.layer_stride != layer_size or page_stride < page_size:
                     raise ValueError(f"Step KV cache requires contiguous per-layer views for {layer_name}.")
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
-                end = start + layer_size
+                end = start + layer_size + (kv_cache_config.num_blocks - 1) * (page_stride - page_size)
                 if end > step_backing.numel():
                     raise ValueError(f"Step KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = step_backing[start:end]

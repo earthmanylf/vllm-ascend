@@ -3575,6 +3575,34 @@ def test_step5_reshape_rejects_non_tensor_step_aux_raw(monkeypatch) -> None:
         _step5_reshape(config, raw, monkeypatch)
 
 
+def test_step5_aux_page_riding_in_a_wide_stack_spans_the_page_gaps(monkeypatch) -> None:
+    """A narrow page may sit a main-page stride apart inside a wider stack of
+    the same block id (the Step5 planner parks the sparse summary there): the
+    raw slice then spans the gaps between the pages and the typed view keeps
+    the planned stride."""
+    tensors, groups = _step5_tensors_and_groups()
+    in_page = (STEP5_MAIN_PAGE - STEP5_SUMMARY_PAGE) // 2
+    tensors[1] = KVCacheTensor(
+        size=2 * STEP5_MAIN_PAGE * STEP5_NUM_BLOCKS,
+        layers=[STEP5_SUMMARY],
+        layer_stride=STEP5_SUMMARY_PAGE * STEP5_NUM_BLOCKS,
+        block_stride=STEP5_MAIN_PAGE,
+        offset=STEP5_MAIN_PAGE * STEP5_NUM_BLOCKS + in_page,
+    )
+    config = _step5_kv_cache_config(tensors, groups)
+    raw = _step5_allocate(config, _step5_vllm_config("step5"), monkeypatch)
+
+    # Block b's summary page sits in_page bytes into block b's second wide
+    # page, on the backing shared with the main layers.
+    assert raw[STEP5_SUMMARY].untyped_storage().data_ptr() == raw[STEP5_L0].untyped_storage().data_ptr()
+    assert raw[STEP5_SUMMARY].data_ptr() == raw[STEP5_L2].data_ptr() + in_page
+    assert raw[STEP5_SUMMARY].numel() == (STEP5_NUM_BLOCKS - 1) * STEP5_MAIN_PAGE + STEP5_SUMMARY_PAGE
+
+    caches = _step5_reshape(config, raw, monkeypatch)
+    assert caches[STEP5_SUMMARY].data_ptr() == raw[STEP5_SUMMARY].data_ptr()
+    assert caches[STEP5_SUMMARY].stride(0) * caches[STEP5_SUMMARY].element_size() == STEP5_MAIN_PAGE
+
+
 @pytest.mark.parametrize(
     "target_dtype,layer_dtype,packed",
     [

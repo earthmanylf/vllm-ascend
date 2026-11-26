@@ -40,15 +40,21 @@ layouts use.
 from __future__ import annotations
 
 from collections.abc import Callable
+from itertools import accumulate
 
 from vllm.config import VllmConfig
 from vllm.logger import logger
-from vllm.v1.core.kv_cache_planning import may_override_num_blocks
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_planning import (
+    create_kv_cache_group_specs,
+    may_override_num_blocks,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -75,6 +81,11 @@ def _padded_page(spec: KVCacheSpec) -> int:
     page = spec.page_size_bytes
     alignment = _page_alignment(spec)
     return page + (-page % alignment)
+
+
+def _starts_on_grid(pages: list[int], offset: int, grid: int) -> bool:
+    """Whether any page of a block of ``pages`` placed at ``offset`` starts on ``grid``."""
+    return any(start % grid == 0 for start in accumulate(pages, initial=offset))
 
 
 def is_step5_kv_cache_spec(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
@@ -155,6 +166,32 @@ def get_step5_kv_cache_groups(
             groups.extend(KVCacheGroupSpec([name], spec) for name, spec in aux_specs.items())
         else:
             groups.append(KVCacheGroupSpec(list(aux_specs.keys()), uniform))
+
+    swa_indices = [
+        idx
+        for idx, group in enumerate(groups)
+        if group.layer_names and all(isinstance(spec, SlidingWindowSpec) for _, spec in _layer_specs(group))
+    ]
+    swa_names = [name for name, spec in main_specs.items() if isinstance(spec, SlidingWindowSpec)]
+    grouped_swa = sorted(name for idx in swa_indices for name in groups[idx].layer_names)
+    # Re-split only a bucket upstream grouped on its own: sliding layers that
+    # sit in mixed groups (a model-declared grouping) are left alone.
+    if len(swa_indices) > 1 and grouped_swa == sorted(swa_names):
+        others = [group for idx, group in enumerate(groups) if idx not in swa_indices]
+        at = swa_indices[0]  # every group before the first sliding-window one is in `others`
+        best = get_step5_max_memory_usage(vllm_config, groups)
+        for num_groups in range(1, len(swa_indices)):
+            try:
+                split = create_kv_cache_group_specs(
+                    main_specs,
+                    [swa_names[i::num_groups] for i in range(num_groups)],
+                )
+            except (AssertionError, ValueError):
+                continue  # layers the merge refuses cannot share a group
+            candidate = others[:at] + split + others[at:]
+            usage = get_step5_max_memory_usage(vllm_config, candidate)
+            if usage < best:
+                groups, best = candidate, usage
     return groups
 
 
@@ -204,8 +241,6 @@ def get_step5_max_memory_usage(
     holds one bucket, full attention grows to max_model_len) times the
     envelope width.
     """
-    from vllm.utils.math_utils import cdiv
-
     envelope = _step5_envelope(kv_cache_groups)
     total_pages = 0
     for group in kv_cache_groups:
@@ -247,39 +282,75 @@ def get_step5_kv_cache_config_from_groups(
         num_blocks,
     )
 
-    kv_cache_tensors: list[KVCacheTensor] = []
+    wide_page = max(page_sizes)
+    wide_stacks = max(
+        sum(1 for _, spec in _layer_specs(group) if spec.page_size_bytes == wide_page) for group in kv_cache_groups
+    )
     backing_size = envelope * num_blocks
-    for group in kv_cache_groups:
-        byte_offset = 0
-        for layer_name, spec in _layer_specs(group):
-            layer_stride = spec.page_size_bytes * num_blocks
-            if byte_offset + layer_stride > backing_size:
-                raise ValueError(
-                    f"Step5 group ({group.layer_names[0]} ..) does not fit the {envelope}-byte envelope backing."
-                )
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=backing_size,
-                    layers=[layer_name],
-                    layer_stride=layer_stride,
-                    block_stride=spec.page_size_bytes,
-                    offset=byte_offset,
-                )
+    kv_cache_tensors: list[KVCacheTensor] = []
+
+    def add_layer(layer_name: str, spec: KVCacheSpec, offset: int, block_stride: int) -> None:
+        if offset + (num_blocks - 1) * block_stride + spec.page_size_bytes > backing_size:
+            raise ValueError(f"Step5 layer {layer_name} does not fit the {envelope}-byte envelope backing.")
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=backing_size,
+                layers=[layer_name],
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=block_stride,
+                offset=offset,
             )
-            byte_offset += layer_stride
+        )
+
+    riding: set[int] = set()  # wide stacks already lending their page
+    narrow_top = wide_stacks * wide_page * num_blocks  # first byte past every wide stack
+    for group in kv_cache_groups:
+        wide = [(name, spec) for name, spec in _layer_specs(group) if spec.page_size_bytes == wide_page]
+        narrow = [(name, spec) for name, spec in _layer_specs(group) if spec.page_size_bytes < wide_page]
+        for stack, (layer_name, spec) in enumerate(wide):
+            add_layer(layer_name, spec, stack * wide_page * num_blocks, wide_page)
+        if not narrow:
+            continue
+        narrow_bytes = sum(spec.page_size_bytes for _, spec in narrow)
+        # A rider shares its stack with the K and V views of the wide layers
+        # there, which start at every block's page start and half-page point,
+        # and the zeroer takes one stride per start address. The narrow block
+        # therefore sits as near the page centre as a 32-byte boundary (the
+        # indexer operator's minimum) allows without any narrow page starting
+        # on that half-page grid, so it keeps a segment of its own.
+        pages = [spec.page_size_bytes for _, spec in narrow]
+        slack = wide_page - narrow_bytes
+        in_page = next(
+            (
+                offset
+                for offset in sorted(range(0, slack + 1, 32), key=lambda offset: abs(offset - slack // 2))
+                if not _starts_on_grid(pages, offset, wide_page // 2)
+            ),
+            None,
+        )
+        ride = None
+        if in_page is not None:
+            ride = next((stack for stack in range(len(wide), wide_stacks) if stack not in riding), None)
+        offset = narrow_top if ride is None else ride * wide_page * num_blocks + in_page
+        for layer_name, spec in narrow:
+            add_layer(layer_name, spec, offset, wide_page if ride is not None else spec.page_size_bytes)
+            offset += spec.page_size_bytes * (1 if ride is not None else num_blocks)
+        if ride is None:
+            narrow_top = offset
+        else:
+            riding.add(ride)
 
     # Upstream's recycled-block zeroer maps one stride per start address;
-    # same-page views may share a start (equal strides dedup), but two page
-    # classes sharing one start would be inexpressible.
-    start_pages: dict[int, int] = {}
+    # same-stride views may share a start, but two strides at one start
+    # would be inexpressible.
+    start_strides: dict[int, int] = {}
     for tensor in kv_cache_tensors:
-        page = tensor.block_stride
-        if start_pages.setdefault(tensor.offset, page) != page:
+        stride = start_strides.setdefault(tensor.offset, tensor.block_stride)
+        if stride != tensor.block_stride:
             raise ValueError(
-                f"Step5 envelope aliasing puts a {page}-byte page at a "
-                f"start address already held by a "
-                f"{start_pages[tensor.offset]}-byte page; per-class stack "
-                f"bases must keep start addresses disjoint."
+                f"Step5 envelope aliasing puts a {tensor.block_stride}-byte page stride at a "
+                f"start address already held by a {stride}-byte one; stack bases "
+                f"must keep start addresses disjoint."
             )
 
     return KVCacheConfig(
